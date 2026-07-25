@@ -79,7 +79,6 @@ Output: `bin\Release\net8.0\BackUper.exe`
 
 - **Windows only** (relies on undocumented `NtQuerySystemInformation`)
 - **Local files only** — no network paths for locked files (Strategy 4 requires local handle enumeration)
-- **Large files** — Strategy 4 maps entire file into memory; files >2GB may need chunked reading (not yet implemented)
 - **Strategy 5** requires the locking app to be restartable via Restart Manager (most GUI apps are)
 
 ## License
