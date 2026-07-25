@@ -7,6 +7,7 @@ C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUpe
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.AssemblyInfoInputs.cache
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.AssemblyInfo.cs
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.csproj.CoreCompileInputs.cache
+C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.sourcelink.json
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.dll
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\refint\BackUper.dll
 C:\Users\Abdulrahman\OneDrive\Desktop\BackUper\BackUper\obj\Debug\net8.0\BackUper.pdb

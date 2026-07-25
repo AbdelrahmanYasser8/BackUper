@@ -319,13 +319,26 @@ internal static class HandleDuplicateCopy
         return ntPath;
     }
 
+    private const long ChunkSize = 256L * 1024 * 1024; // 256 MB
+
     private static byte[]? ReadViaFileMapping(IntPtr handle)
     {
         if (!GetFileSizeEx(handle, out long fileSize) || fileSize == 0)
             return fileSize == 0 ? Array.Empty<byte>() : null;
 
-        IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, // PAGE_READONLY
-            0, 0, IntPtr.Zero);
+        // For small files, use single mapping (faster)
+        if (fileSize <= ChunkSize)
+        {
+            return ReadSingleMapping(handle, fileSize);
+        }
+
+        // For large files, use chunked mapping
+        return ReadChunkedMapping(handle, fileSize);
+    }
+
+    private static byte[]? ReadSingleMapping(IntPtr handle, long fileSize)
+    {
+        IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, 0, 0, IntPtr.Zero);
         if (mapping == IntPtr.Zero)
             return null;
 
@@ -350,6 +363,49 @@ internal static class HandleDuplicateCopy
         {
             CloseHandle(mapping);
         }
+    }
+
+    private static byte[]? ReadChunkedMapping(IntPtr handle, long fileSize)
+    {
+        byte[] data = new byte[fileSize];
+        long offset = 0;
+
+        while (offset < fileSize)
+        {
+            long remaining = fileSize - offset;
+            int chunkLen = (int)Math.Min(ChunkSize, remaining);
+
+            uint offsetHigh = (uint)(offset >> 32);
+            uint offsetLow = (uint)(offset & 0xFFFFFFFF);
+
+            IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, 0, 0, IntPtr.Zero);
+            if (mapping == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                IntPtr view = MapViewOfFile(mapping, FILE_MAP_READ, offsetHigh, offsetLow, (IntPtr)chunkLen);
+                if (view == IntPtr.Zero)
+                    return null;
+
+                try
+                {
+                    Marshal.Copy(view, data, (int)offset, chunkLen);
+                }
+                finally
+                {
+                    UnmapViewOfFile(view);
+                }
+            }
+            finally
+            {
+                CloseHandle(mapping);
+            }
+
+            offset += chunkLen;
+        }
+
+        return data;
     }
 
     private static byte[]? ReadViaReadFile(IntPtr handle)
