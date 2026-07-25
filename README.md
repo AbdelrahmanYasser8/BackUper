@@ -6,8 +6,10 @@ A Windows file copy tool that can copy locked files (including exclusively locke
 
 - **Copies locked files** — Handles files locked by other processes
 - **No admin required** — Runs as standard user
+- **Doesn't close apps** — Strategy 4 reads via handle duplication without terminating the locking process
 - **5 fallback strategies** — Tries progressively more powerful methods until one works
 - **Single command** — `BackUper copy <source> <destination>`
+- **Arbitrary file sizes** — Chunked 256 MB memory mapping supports files >2 GB while reading from kernel cache
 
 ## Requirements
 
@@ -39,7 +41,7 @@ The tool tries strategies in order, stopping at the first success:
 | 1 | **Normal copy** | `File.Copy` | No | No |
 | 2 | **Shared FileStream** | Opens with `FileShare.ReadWrite` | No | No |
 | 3 | **esentutl** | Windows built-in ESENT utility | No | No |
-| 4 | **Handle duplication** | Enumerates system handles via `NtQuerySystemInformation`, duplicates the locking process's file handle into our process, reads via `CreateFileMapping`/`MapViewOfFile` | **No** | **No** |
+| 4 | **Handle duplication** | Enumerates system handles via `NtQuerySystemInformation`, duplicates the locking process's file handle into our process, reads via chunked `CreateFileMapping`/`MapViewOfFile` (256 MB windows) | **No** | **No** |
 | 5 | **Restart Manager** | Registers file with `RmStartSession`, shuts down locking app via `RmShutdown`, copies, restarts app via `RmRestart` | No | **Yes** (last resort) |
 
 ### Strategy 4 Details (The Key Feature)
@@ -50,7 +52,7 @@ Strategy 4 is what makes BackUper unique for exclusive locks:
 2. For each handle, opens the owning process with `PROCESS_DUP_HANDLE`
 3. Calls `DuplicateHandle` to clone the file handle into our process
 4. Uses `GetFinalPathNameByHandle` to verify it's the target file
-5. Reads the file content via memory-mapped I/O (`CreateFileMapping` + `MapViewOfFile`) — this reads from the kernel file cache, bypassing the exclusive lock
+5. Reads the file content via **chunked memory-mapped I/O** — maps the file in 256 MB windows via `CreateFileMapping` + `MapViewOfFile` with offset, copies each chunk, then unmaps. This reads from the kernel file cache, bypassing the exclusive lock, and works for files of any size.
 6. Writes the bytes to the destination
 
 This works because the kernel allows duplicating an existing valid handle even if the original was opened with `FileShare.None`. The duplicated handle inherits the same access rights.
@@ -80,6 +82,7 @@ Output: `bin\Release\net8.0\BackUper.exe`
 - **Windows only** (relies on undocumented `NtQuerySystemInformation`)
 - **Local files only** — no network paths for locked files (Strategy 4 requires local handle enumeration)
 - **Strategy 5** requires the locking app to be restartable via Restart Manager (most GUI apps are)
+- **Separate WAL files not copied** — if a database uses a separate `-wal`/`-shm` file (e.g., SQLite in WAL mode), only the main file is copied; uncommitted writes in the WAL file are missed
 
 ## License
 

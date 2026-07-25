@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("BackUper")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+23f3acc8f3a226e5ad381615b77c99601e908f01")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+60b8162b92709b46e7784f925919f840c1cd931c")]
 [assembly: System.Reflection.AssemblyProductAttribute("BackUper")]
 [assembly: System.Reflection.AssemblyTitleAttribute("BackUper")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
