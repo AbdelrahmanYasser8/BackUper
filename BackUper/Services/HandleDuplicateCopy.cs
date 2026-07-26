@@ -128,6 +128,8 @@ internal static class HandleDuplicateCopy
 
     #endregion
 
+    private const long ChunkSize = 256L * 1024 * 1024; // 256 MB
+
     /// <summary>
     /// Attempts to copy a locked file by duplicating an existing handle to it.
     /// Returns true if successful.
@@ -318,8 +320,6 @@ internal static class HandleDuplicateCopy
 
         return ntPath;
     }
-
-    private const long ChunkSize = 256L * 1024 * 1024; // 256 MB
 
     private static byte[]? ReadViaFileMapping(IntPtr handle)
     {

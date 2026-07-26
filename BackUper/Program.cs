@@ -10,35 +10,87 @@ if (args.Length < 3)
 var inputPath = Path.GetFullPath(args[1]);
 var outputPath = Path.GetFullPath(args[2]);
 
-if (!File.Exists(inputPath))
+if (!File.Exists(inputPath) && !Directory.Exists(inputPath))
 {
-    Console.WriteLine($"Error: Input file not found: {inputPath}");
+    Console.WriteLine($"Error: Input not found: {inputPath}");
     return;
 }
 
-CopyFileWithFallback(inputPath, outputPath);
-
-static void CopyFileWithFallback(string inputPath, string outputPath)
+if (Directory.Exists(inputPath))
 {
-    var dir = Path.GetDirectoryName(outputPath);
-    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-        Directory.CreateDirectory(dir);
+    CopyDirectory(inputPath, outputPath);
+}
+else
+{
+    CopyFileWithFallback(inputPath, outputPath);
+}
 
-    var totalSize = new FileInfo(inputPath).Length;
-    Console.WriteLine($"Source: {inputPath} ({totalSize:N0} bytes)");
-    Console.WriteLine($"Target: {outputPath}");
+static void CopyDirectory(string sourceDir, string destDir)
+{
+    if (!Directory.Exists(sourceDir))
+    {
+        Console.WriteLine($"Error: Source directory not found: {sourceDir}");
+        return;
+    }
+
+    if (!Directory.Exists(destDir))
+    {
+        Directory.CreateDirectory(destDir);
+    }
+
+    var files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
+    Console.WriteLine($"Found {files.Length} file(s) to copy");
     Console.WriteLine();
-    Console.WriteLine("Strategies tried:");
+
+    int successCount = 0;
+    int failCount = 0;
+
+    foreach (var file in files)
+    {
+        string relativePath = Path.GetRelativePath(sourceDir, file);
+        string destFile = Path.Combine(destDir, relativePath);
+
+        Console.WriteLine($"[{successCount + failCount + 1}/{files.Length}] {relativePath}");
+
+        string? destDirOnly = Path.GetDirectoryName(destFile);
+        if (!string.IsNullOrEmpty(destDirOnly) && !Directory.Exists(destDirOnly))
+            Directory.CreateDirectory(destDirOnly!);
+
+        bool success = CopyFileWithFallback(file, destFile, silent: true);
+        if (success)
+            successCount++;
+        else
+            failCount++;
+
+        Console.WriteLine();
+    }
+
+    Console.WriteLine($"=== Summary ===");
+    Console.WriteLine($"Total:  {files.Length}");
+    Console.WriteLine($"Copied: {successCount}");
+    Console.WriteLine($"Failed: {failCount}");
+}
+
+static bool CopyFileWithFallback(string inputPath, string outputPath, bool silent = false)
+{
+    if (!silent)
+    {
+        var totalSize = new FileInfo(inputPath).Length;
+        Console.WriteLine($"Source: {inputPath} ({totalSize:N0} bytes)");
+        Console.WriteLine($"Target: {outputPath}");
+        Console.WriteLine();
+        Console.WriteLine("Strategies tried:");
+    }
 
     // Strategy 1: Normal copy
     try
     {
         File.Copy(inputPath, outputPath, overwrite: true);
-        Console.WriteLine("  [1] Normal copy .............. SUCCESS");
-        PrintResult(outputPath);
-        return;
+        if (!silent) Console.WriteLine("  [1] Normal copy .............. SUCCESS");
+        if (!silent) PrintResult(outputPath);
+        return true;
     }
-    catch (IOException) { Console.WriteLine("  [1] Normal copy .............. SKIPPED (file locked)"); }
+    catch (IOException) { if (!silent) Console.WriteLine("  [1] Normal copy .............. SKIPPED (file locked)"); }
 
     // Strategy 2: Shared-access FileStream
     try
@@ -47,11 +99,11 @@ static void CopyFileWithFallback(string inputPath, string outputPath)
             FileShare.ReadWrite | FileShare.Delete | FileShare.Write);
         using var dst = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
         src.CopyTo(dst);
-        Console.WriteLine("  [2] Shared-access copy ....... SUCCESS");
-        PrintResult(outputPath);
-        return;
+        if (!silent) Console.WriteLine("  [2] Shared-access copy ....... SUCCESS");
+        if (!silent) PrintResult(outputPath);
+        return true;
     }
-    catch (IOException) { Console.WriteLine("  [2] Shared-access copy ....... SKIPPED (exclusive lock)"); }
+    catch (IOException) { if (!silent) Console.WriteLine("  [2] Shared-access copy ....... SKIPPED (exclusive lock)"); }
 
     // Strategy 3: esentutl (built-in Windows tool)
     try
@@ -69,55 +121,59 @@ static void CopyFileWithFallback(string inputPath, string outputPath)
         process.WaitForExit(60000);
         if (process.ExitCode == 0 && File.Exists(outputPath))
         {
-            Console.WriteLine("  [3] esentutl copy ............ SUCCESS");
-            PrintResult(outputPath);
-            return;
+            if (!silent) Console.WriteLine("  [3] esentutl copy ............ SUCCESS");
+            if (!silent) PrintResult(outputPath);
+            return true;
         }
-        Console.WriteLine("  [3] esentutl copy ............ FAILED (exit code " + process.ExitCode + ")");
+        if (!silent) Console.WriteLine("  [3] esentutl copy ............ FAILED (exit code " + process.ExitCode + ")");
     }
-    catch { Console.WriteLine("  [3] esentutl copy ............ SKIPPED (not available)"); }
+    catch { if (!silent) Console.WriteLine("  [3] esentutl copy ............ SKIPPED (not available)"); }
 
     // Strategy 4: Duplicate handle (no admin, no app close)
     try
     {
         if (HandleDuplicateCopy.TryCopy(inputPath, outputPath))
         {
-            Console.WriteLine("  [4] Handle duplicate ......... SUCCESS");
-            PrintResult(outputPath);
-            return;
+            if (!silent) Console.WriteLine("  [4] Handle duplicate ......... SUCCESS");
+            if (!silent) PrintResult(outputPath);
+            return true;
         }
-        Console.WriteLine("  [4] Handle duplicate ......... FAILED (no matching handle found)");
+        if (!silent) Console.WriteLine("  [4] Handle duplicate ......... FAILED (no matching handle found)");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"  [4] Handle duplicate ......... FAILED ({ex.Message})");
+        if (!silent) Console.WriteLine($"  [4] Handle duplicate ......... FAILED ({ex.Message})");
     }
 
     // Strategy 5: Restart Manager (shuts down locking app, copies, restarts it)
     try
     {
-        Console.WriteLine("  [5] Restart Manager .......... RUNNING (may close app)...");
+        if (!silent) Console.WriteLine("  [5] Restart Manager .......... RUNNING (may close app)...");
         RestartManager.CopyWithRestart(inputPath, outputPath);
-        Console.WriteLine("  [5] Restart Manager .......... SUCCESS");
-        PrintResult(outputPath);
-        return;
+        if (!silent) Console.WriteLine("  [5] Restart Manager .......... SUCCESS");
+        if (!silent) PrintResult(outputPath);
+        return true;
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"  [5] Restart Manager .......... FAILED ({ex.Message})");
+        if (!silent) Console.WriteLine($"  [5] Restart Manager .......... FAILED ({ex.Message})");
     }
 
     // All strategies failed
-    Console.WriteLine();
-    Console.WriteLine("RESULT: All strategies failed.");
-    var processes = GetProcessesLockingFile(inputPath);
-    if (processes.Count > 0)
+    if (!silent)
     {
-        Console.WriteLine("Locked by:");
-        foreach (var (name, pid) in processes)
-            Console.WriteLine($"  - {name} (PID: {pid})");
+        Console.WriteLine();
+        Console.WriteLine("RESULT: All strategies failed.");
+        var processes = GetProcessesLockingFile(inputPath);
+        if (processes.Count > 0)
+        {
+            Console.WriteLine("Locked by:");
+            foreach (var (name, pid) in processes)
+                Console.WriteLine($"  - {name} (PID: {pid})");
+        }
+        Console.WriteLine("Close the application that has this file open and try again.");
     }
-    Console.WriteLine("Close the application that has this file open and try again.");
+    return false;
 }
 
 static void PrintResult(string outputPath)
