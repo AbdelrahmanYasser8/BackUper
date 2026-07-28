@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace BackUper.Services;
 
@@ -128,13 +129,21 @@ internal static class HandleDuplicateCopy
 
     #endregion
 
+    internal sealed class ChunkProgress
+    {
+        public int CompletedChunks { get; set; }
+        public int TotalChunks { get; set; }
+        public double CurrentChunkPercent { get; set; }
+        public double OverallPercent { get; set; }
+    }
+
     private const long ChunkSize = 256L * 1024 * 1024; // 256 MB
 
     /// <summary>
     /// Attempts to copy a locked file by duplicating an existing handle to it.
     /// Returns true if successful.
     /// </summary>
-    internal static bool TryCopy(string sourcePath, string destinationPath)
+    internal static bool TryCopy(string sourcePath, string destinationPath, Action<ChunkProgress>? onProgress = null)
     {
         var normalizedSource = Path.GetFullPath(sourcePath).ToLowerInvariant();
         var targetSuffix = ExtractStableSuffix(normalizedSource);
@@ -186,15 +195,18 @@ internal static class HandleDuplicateCopy
                     if (normFilePath != normalizedSource && !normFilePath.EndsWith(targetSuffix))
                         continue;
 
-                    byte[]? fileContent = ReadViaFileMapping(dupHandle);
-                    if (fileContent == null)
-                        fileContent = ReadViaReadFile(dupHandle);
+                    using var outputStream = new FileStream(destinationPath, FileMode.Create,
+                        FileAccess.Write, FileShare.None, bufferSize: 16 * 1024 * 1024,
+                        FileOptions.SequentialScan);
 
-                    if (fileContent != null)
-                    {
-                        File.WriteAllBytes(destinationPath, fileContent);
+                    if (ReadViaFileMapping(dupHandle, outputStream, onProgress))
                         return true;
-                    }
+
+                    outputStream.Position = 0;
+                    outputStream.SetLength(0);
+
+                    if (ReadViaReadFile(dupHandle, outputStream))
+                        return true;
 
                     return false;
                 }
@@ -321,38 +333,46 @@ internal static class HandleDuplicateCopy
         return ntPath;
     }
 
-    private static byte[]? ReadViaFileMapping(IntPtr handle)
+    private static bool ReadViaFileMapping(IntPtr handle, FileStream outputStream, Action<ChunkProgress>? onProgress = null)
     {
         if (!GetFileSizeEx(handle, out long fileSize) || fileSize == 0)
-            return fileSize == 0 ? Array.Empty<byte>() : null;
+            return fileSize == 0;
 
-        // For small files, use single mapping (faster)
         if (fileSize <= ChunkSize)
-        {
-            return ReadSingleMapping(handle, fileSize);
-        }
+            return ReadSingleMapping(handle, outputStream, fileSize);
 
-        // For large files, use chunked mapping
-        return ReadChunkedMapping(handle, fileSize);
+        return ReadChunkedMapping(handle, outputStream, fileSize, onProgress);
     }
 
-    private static byte[]? ReadSingleMapping(IntPtr handle, long fileSize)
+    private static bool ReadSingleMapping(IntPtr handle, FileStream outputStream, long fileSize)
     {
         IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, 0, 0, IntPtr.Zero);
         if (mapping == IntPtr.Zero)
-            return null;
+            return false;
 
         try
         {
             IntPtr view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, IntPtr.Zero);
             if (view == IntPtr.Zero)
-                return null;
+                return false;
 
             try
             {
-                byte[] data = new byte[fileSize];
-                Marshal.Copy(view, data, 0, (int)fileSize);
-                return data;
+                const int bufferSize = 16 * 1024 * 1024;
+                byte[] buffer = new byte[bufferSize];
+                long remaining = fileSize;
+                int offset = 0;
+
+                while (remaining > 0)
+                {
+                    int toCopy = (int)Math.Min(bufferSize, remaining);
+                    Marshal.Copy(IntPtr.Add(view, offset), buffer, 0, toCopy);
+                    outputStream.Write(buffer, 0, toCopy);
+                    offset += toCopy;
+                    remaining -= toCopy;
+                }
+
+                return true;
             }
             finally
             {
@@ -365,69 +385,126 @@ internal static class HandleDuplicateCopy
         }
     }
 
-    private static byte[]? ReadChunkedMapping(IntPtr handle, long fileSize)
+    private static bool ReadChunkedMapping(IntPtr handle, FileStream outputStream, long fileSize, Action<ChunkProgress>? onProgress)
     {
-        byte[] data = new byte[fileSize];
+        int totalChunks = (int)Math.Ceiling((double)fileSize / ChunkSize);
         long offset = 0;
+        int completedChunks = 0;
+        long currentChunkBytes = 0;
+        long currentChunkTotal = 0;
+        bool isDone = false;
 
-        while (offset < fileSize)
+        Timer? progressTimer = null;
+        if (onProgress != null)
         {
-            long remaining = fileSize - offset;
-            int chunkLen = (int)Math.Min(ChunkSize, remaining);
-
-            uint offsetHigh = (uint)(offset >> 32);
-            uint offsetLow = (uint)(offset & 0xFFFFFFFF);
-
-            IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, 0, 0, IntPtr.Zero);
-            if (mapping == IntPtr.Zero)
-                return null;
-
-            try
+            progressTimer = new Timer(_ =>
             {
-                IntPtr view = MapViewOfFile(mapping, FILE_MAP_READ, offsetHigh, offsetLow, (IntPtr)chunkLen);
-                if (view == IntPtr.Zero)
-                    return null;
+                if (isDone) return;
+                long copied = Interlocked.Read(ref currentChunkBytes);
+                long total = Interlocked.Read(ref currentChunkTotal);
+                if (total > 0)
+                {
+                    double chunkPct = (double)copied / total * 100.0;
+                    double overallPct = ((double)completedChunks * ChunkSize + copied) / fileSize * 100.0;
+                    onProgress(new ChunkProgress
+                    {
+                        CompletedChunks = completedChunks,
+                        TotalChunks = totalChunks,
+                        CurrentChunkPercent = chunkPct,
+                        OverallPercent = overallPct
+                    });
+                }
+            }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+        }
+
+        try
+        {
+            byte[] subBuffer = new byte[16 * 1024 * 1024];
+
+            while (offset < fileSize)
+            {
+                long remaining = fileSize - offset;
+                int chunkLen = (int)Math.Min(ChunkSize, remaining);
+                Interlocked.Exchange(ref currentChunkTotal, chunkLen);
+                Interlocked.Exchange(ref currentChunkBytes, 0);
+
+                uint offsetHigh = (uint)(offset >> 32);
+                uint offsetLow = (uint)(offset & 0xFFFFFFFF);
+
+                IntPtr mapping = CreateFileMapping(handle, IntPtr.Zero, 0x02, 0, 0, IntPtr.Zero);
+                if (mapping == IntPtr.Zero)
+                    return false;
 
                 try
                 {
-                    Marshal.Copy(view, data, (int)offset, chunkLen);
+                    IntPtr view = MapViewOfFile(mapping, FILE_MAP_READ, offsetHigh, offsetLow, (IntPtr)chunkLen);
+                    if (view == IntPtr.Zero)
+                        return false;
+
+                    try
+                    {
+                        long copied = 0;
+                        while (copied < chunkLen)
+                        {
+                            int copyLen = (int)Math.Min(subBuffer.Length, chunkLen - copied);
+                            Marshal.Copy(IntPtr.Add(view, (int)copied), subBuffer, 0, copyLen);
+                            outputStream.Write(subBuffer, 0, copyLen);
+                            copied += copyLen;
+                            Interlocked.Exchange(ref currentChunkBytes, copied);
+                        }
+                    }
+                    finally
+                    {
+                        UnmapViewOfFile(view);
+                    }
                 }
                 finally
                 {
-                    UnmapViewOfFile(view);
+                    CloseHandle(mapping);
                 }
-            }
-            finally
-            {
-                CloseHandle(mapping);
-            }
 
-            offset += chunkLen;
+                completedChunks++;
+                offset += chunkLen;
+
+                onProgress?.Invoke(new ChunkProgress
+                {
+                    CompletedChunks = completedChunks,
+                    TotalChunks = totalChunks,
+                    CurrentChunkPercent = 100.0,
+                    OverallPercent = (double)completedChunks / totalChunks * 100.0
+                });
+            }
+        }
+        finally
+        {
+            isDone = true;
+            progressTimer?.Dispose();
         }
 
-        return data;
+        return true;
     }
 
-    private static byte[]? ReadViaReadFile(IntPtr handle)
+    private static bool ReadViaReadFile(IntPtr handle, FileStream outputStream)
     {
         if (!GetFileSizeEx(handle, out long fileSize) || fileSize == 0)
-            return fileSize == 0 ? Array.Empty<byte>() : null;
+            return fileSize == 0;
 
         SetFilePointerEx(handle, 0, out _, 0); // FILE_BEGIN
 
-        byte[] data = new byte[fileSize];
-        int totalRead = 0;
+        byte[] buffer = new byte[16 * 1024 * 1024];
+        long remaining = fileSize;
 
-        while (totalRead < fileSize)
+        while (remaining > 0)
         {
-            int toRead = (int)Math.Min(fileSize - totalRead, int.MaxValue);
-            if (!ReadFile(handle, data, (uint)toRead, out uint bytesRead, IntPtr.Zero) || bytesRead == 0)
-                return null;
+            int toRead = (int)Math.Min(buffer.Length, remaining);
+            if (!ReadFile(handle, buffer, (uint)toRead, out uint bytesRead, IntPtr.Zero) || bytesRead == 0)
+                return false;
 
-            totalRead += (int)bytesRead;
+            outputStream.Write(buffer, 0, (int)bytesRead);
+            remaining -= bytesRead;
         }
 
-        return data;
+        return true;
     }
 
     private static string ExtractStableSuffix(string fullPath)

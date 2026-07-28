@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading;
 using BackUper.Services;
 
 if (args.Length < 3)
@@ -85,9 +86,51 @@ static bool CopyFileWithFallback(string inputPath, string outputPath, bool silen
     // Strategy 1: Normal copy
     try
     {
-        File.Copy(inputPath, outputPath, overwrite: true);
-        if (!silent) Console.WriteLine("  [1] Normal copy .............. SUCCESS");
-        if (!silent) PrintResult(outputPath);
+        using var src = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read, bufferSize: 16 * 1024 * 1024, FileOptions.SequentialScan);
+        using var dst = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
+            FileShare.None, bufferSize: 16 * 1024 * 1024, FileOptions.SequentialScan);
+
+        long totalSize1 = src.Length;
+        long bytesCopied1 = 0;
+        bool progressStarted1 = false;
+        Timer? timer1 = null;
+        if (!silent)
+        {
+            timer1 = new Timer(_ =>
+            {
+                long copied = Interlocked.Read(ref bytesCopied1);
+                double pct = totalSize1 > 0 ? (double)copied / totalSize1 * 100.0 : 0;
+                if (!progressStarted1)
+                {
+                    progressStarted1 = true;
+                    Console.WriteLine();
+                }
+                Console.Write($"\r  [1] Normal copy .............. {pct:F1}% | {copied:N0} / {totalSize1:N0} bytes   ");
+            }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+        }
+
+        try
+        {
+            byte[] buffer = new byte[16 * 1024 * 1024];
+            int bytesRead;
+            while ((bytesRead = src.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                dst.Write(buffer, 0, bytesRead);
+                Interlocked.Add(ref bytesCopied1, bytesRead);
+            }
+        }
+        finally
+        {
+            timer1?.Dispose();
+        }
+
+        if (!silent)
+        {
+            if (progressStarted1) Console.Write($"\r{new string(' ', 80)}\r");
+            Console.WriteLine("  [1] Normal copy .............. SUCCESS");
+            PrintResult(outputPath);
+        }
         return true;
     }
     catch (IOException) { if (!silent) Console.WriteLine("  [1] Normal copy .............. SKIPPED (file locked)"); }
@@ -98,9 +141,47 @@ static bool CopyFileWithFallback(string inputPath, string outputPath, bool silen
         using var src = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete | FileShare.Write);
         using var dst = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        src.CopyTo(dst);
-        if (!silent) Console.WriteLine("  [2] Shared-access copy ....... SUCCESS");
-        if (!silent) PrintResult(outputPath);
+
+        long totalSize2 = src.Length;
+        long bytesCopied2 = 0;
+        bool progressStarted2 = false;
+        Timer? timer2 = null;
+        if (!silent)
+        {
+            timer2 = new Timer(_ =>
+            {
+                long copied = Interlocked.Read(ref bytesCopied2);
+                double pct = totalSize2 > 0 ? (double)copied / totalSize2 * 100.0 : 0;
+                if (!progressStarted2)
+                {
+                    progressStarted2 = true;
+                    Console.WriteLine();
+                }
+                Console.Write($"\r  [2] Shared-access copy ....... {pct:F1}% | {copied:N0} / {totalSize2:N0} bytes   ");
+            }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+        }
+
+        try
+        {
+            byte[] buffer = new byte[16 * 1024 * 1024];
+            int bytesRead;
+            while ((bytesRead = src.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                dst.Write(buffer, 0, bytesRead);
+                Interlocked.Add(ref bytesCopied2, bytesRead);
+            }
+        }
+        finally
+        {
+            timer2?.Dispose();
+        }
+
+        if (!silent)
+        {
+            if (progressStarted2) Console.Write($"\r{new string(' ', 80)}\r");
+            Console.WriteLine("  [2] Shared-access copy ....... SUCCESS");
+            PrintResult(outputPath);
+        }
         return true;
     }
     catch (IOException) { if (!silent) Console.WriteLine("  [2] Shared-access copy ....... SKIPPED (exclusive lock)"); }
@@ -118,7 +199,24 @@ static bool CopyFileWithFallback(string inputPath, string outputPath, bool silen
             RedirectStandardError = true
         };
         using var process = Process.Start(psi)!;
-        process.WaitForExit(60000);
+
+        if (!silent)
+        {
+            var spinner = new[] { '|', '/', '-', '\\' };
+            int spinIdx = 0;
+            var deadline = DateTime.UtcNow.AddSeconds(60);
+            while (!process.WaitForExit(200))
+            {
+                if (DateTime.UtcNow > deadline) break;
+                Console.Write($"\r  [3] esentutl copy ............ RUNNING {spinner[spinIdx++ % 4]}  ");
+            }
+            Console.Write($"\r{new string(' ', 80)}\r");
+        }
+        else
+        {
+            process.WaitForExit(60000);
+        }
+
         if (process.ExitCode == 0 && File.Exists(outputPath))
         {
             if (!silent) Console.WriteLine("  [3] esentutl copy ............ SUCCESS");
@@ -132,10 +230,29 @@ static bool CopyFileWithFallback(string inputPath, string outputPath, bool silen
     // Strategy 4: Duplicate handle (no admin, no app close)
     try
     {
-        if (HandleDuplicateCopy.TryCopy(inputPath, outputPath))
+        Action<HandleDuplicateCopy.ChunkProgress>? onProgress = null;
+        bool progressStarted = false;
+        if (!silent)
         {
-            if (!silent) Console.WriteLine("  [4] Handle duplicate ......... SUCCESS");
-            if (!silent) PrintResult(outputPath);
+            onProgress = (p) =>
+            {
+                if (!progressStarted)
+                {
+                    progressStarted = true;
+                    Console.WriteLine();
+                }
+                Console.Write($"\r  [4] Handle duplicate ......... Chunk {p.CompletedChunks}/{p.TotalChunks} | {p.CurrentChunkPercent:F1}% of chunk | Overall: {p.OverallPercent:F1}%   ");
+            };
+        }
+
+        if (HandleDuplicateCopy.TryCopy(inputPath, outputPath, onProgress))
+        {
+            if (!silent)
+            {
+                if (progressStarted) Console.Write($"\r{new string(' ', 80)}\r");
+                Console.WriteLine("  [4] Handle duplicate ......... SUCCESS");
+                PrintResult(outputPath);
+            }
             return true;
         }
         if (!silent) Console.WriteLine("  [4] Handle duplicate ......... FAILED (no matching handle found)");
@@ -148,8 +265,54 @@ static bool CopyFileWithFallback(string inputPath, string outputPath, bool silen
     // Strategy 5: Restart Manager (shuts down locking app, copies, restarts it)
     try
     {
-        if (!silent) Console.WriteLine("  [5] Restart Manager .......... RUNNING (may close app)...");
-        RestartManager.CopyWithRestart(inputPath, outputPath);
+        if (!silent)
+        {
+            Console.WriteLine("  [5] Restart Manager .......... This will shut down the locking app to copy the file.");
+            Console.Write("  [5] Restart Manager .......... Continue? (y/n): ");
+            var key = Console.ReadLine();
+            if (!string.Equals(key?.Trim(), "y", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("  [5] Restart Manager .......... SKIPPED (user declined)");
+                return false;
+            }
+            Console.WriteLine("  [5] Restart Manager .......... RUNNING...");
+        }
+
+        bool progressStarted5 = false;
+        long totalSize5 = new FileInfo(inputPath).Length;
+        Timer? timer5 = null;
+        if (!silent)
+        {
+            timer5 = new Timer(_ =>
+            {
+                if (!progressStarted5)
+                {
+                    progressStarted5 = true;
+                    Console.WriteLine();
+                }
+                Console.Write($"\r  [5] Restart Manager .......... copying...   ");
+            }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5));
+        }
+
+        try
+        {
+            RestartManager.CopyWithRestart(inputPath, outputPath, !silent ? (copied, total) =>
+            {
+                if (!progressStarted5)
+                {
+                    progressStarted5 = true;
+                    Console.WriteLine();
+                }
+                double pct = total > 0 ? (double)copied / total * 100.0 : 0;
+                Console.Write($"\r  [5] Restart Manager .......... {pct:F1}% | {copied:N0} / {total:N0} bytes   ");
+            } : null);
+        }
+        finally
+        {
+            timer5?.Dispose();
+        }
+
+        if (!silent) Console.Write($"\r{new string(' ', 80)}\r");
         if (!silent) Console.WriteLine("  [5] Restart Manager .......... SUCCESS");
         if (!silent) PrintResult(outputPath);
         return true;
