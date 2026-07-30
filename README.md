@@ -8,8 +8,9 @@ A Windows file copy tool that can copy locked files (including exclusively locke
 - **No admin required** — Runs as standard user
 - **Doesn't close apps** — Strategy 4 reads via handle duplication without terminating the locking process
 - **5 fallback strategies** — Tries progressively more powerful methods until one works
-- **Single command** — `BackUper copy <source> <destination>`
-- **Arbitrary file sizes** — Chunked 256 MB memory mapping supports files >2 GB while reading from kernel cache
+- **Live progress** — Real-time percentage display every 5 seconds during copy; interactive confirmation before shutdown-based strategy
+- **No size limit** — Streams directly to disk in chunks, supports files of any size
+- **Single command** — `dotnet run copy <source> <destination>`
 
 ## Requirements
 
@@ -25,7 +26,7 @@ or download from https://dotnet.microsoft.com/en-us/download/dotnet/8.0
 ## Usage
 
 ```cmd
-BackUper copy "C:\path\to\locked\file.pst" "D:\backup\file.pst"
+dotnet run copy "C:\path\to\locked\file.pst" "D:\backup\file.pst"
 ```
 
 **Arguments:**
@@ -37,25 +38,28 @@ BackUper copy "C:\path\to\locked\file.pst" "D:\backup\file.pst"
 The tool tries strategies in order, stopping at the first success:
 
 | # | Strategy | How it works | Admin? | Closes app? |
-|---|----------|--------------|--------|-------------|
-| 1 | **Normal copy** | `File.Copy` | No | No |
-| 2 | **Shared FileStream** | Opens with `FileShare.ReadWrite` | No | No |
-| 3 | **esentutl** | Windows built-in ESENT utility | No | No |
-| 4 | **Handle duplication** | Enumerates system handles via `NtQuerySystemInformation`, duplicates the locking process's file handle into our process, reads via chunked `CreateFileMapping`/`MapViewOfFile` (256 MB windows) | **No** | **No** |
-| 5 | **Restart Manager** | Registers file with `RmStartSession`, shuts down locking app via `RmShutdown`, copies, restarts app via `RmRestart` | No | **Yes** (last resort) |
+|--:|----------|--------------|:------:|:-----------:|
+| 1 | **Normal copy** | Standard `File.Copy` | No | No |
+| 2 | **Shared FileStream** | Opens source with `FileShare.ReadWrite` flags | No | No |
+| 3 | **esentutl** | Shells out to Windows built-in ESENT utility | No | No |
+| 4 | **Handle duplication** | Scans system handles, duplicates the locking process's file handle into our process, reads via chunked memory-mapped I/O (256 MB windows) | **No** | **No** |
+| 5 | **Restart Manager** | Registers file with Windows Restart Manager API, shuts down the locking app, copies the file, then restarts the app | No | **Yes** (last resort) |
 
-### Strategy 4 Details (The Key Feature)
+### How Handle Duplication Works
 
-Strategy 4 is what makes BackUper unique for exclusive locks:
+Strategy 4 is what makes BackUper unique. It can read an exclusively locked file without admin rights and without closing the application. Here's how it works step by step:
 
-1. Calls `NtQuerySystemInformation(SystemHandleInformation)` to get all open handles system-wide
-2. For each handle, opens the owning process with `PROCESS_DUP_HANDLE`
-3. Calls `DuplicateHandle` to clone the file handle into our process
-4. Uses `GetFinalPathNameByHandle` to verify it's the target file
-5. Reads the file content via **chunked memory-mapped I/O** — maps the file in 256 MB windows via `CreateFileMapping` + `MapViewOfFile` with offset, copies each chunk, then unmaps. This reads from the kernel file cache, bypassing the exclusive lock, and works for files of any size.
-6. Writes the bytes to the destination
+1. **Scan all system handles** — Calls the undocumented NT API `NtQuerySystemInformation(SystemHandleInformation)` to get a dump of **every open handle** across every running process on the system (files, registry keys, pipes, etc.)
 
-This works because the kernel allows duplicating an existing valid handle even if the original was opened with `FileShare.None`. The duplicated handle inherits the same access rights.
+2. **Find the locking process** — For each handle in the dump, opens the owning process with `OpenProcess(PROCESS_DUP_HANDLE)` and tries to duplicate the handle into BackUper's process space via `DuplicateHandle`. Resolves the duplicated handle to a file path using `GetFinalPathNameByHandle` and checks if it matches the target file
+
+3. **Duplicate the handle from the kernel** — Once the matching handle is found, `DuplicateHandle` clones it from the locking process directly into BackUper. The kernel allows this because the duplicate inherits the **same access rights** as the original handle — even if the original was opened with `FileShare.None`
+
+4. **Read the file through the duplicated handle** — Creates a memory-mapped file view via `CreateFileMapping` + `MapViewOfFile` on the duplicated handle. For files under 256 MB, the entire file is mapped at once. For larger files, a **chunked approach** is used: 256 MB windows are mapped, copied, and unmapped in sequence, supporting files of any size while keeping memory usage constant
+
+5. **Write to destination** — The bytes read from the mapped view are streamed directly to the output file in 16 MB sub-chunks
+
+> **Why this works:** The Windows kernel maintains a global handle table. Even if a process opens a file with `FileShare.None` (exclusive lock), the underlying file object in the kernel is still accessible. By duplicating the handle, BackUper gains the same kernel-level access as the locking process — reading is permitted because the original handle already has read rights.
 
 ## Supported Lock Types
 
